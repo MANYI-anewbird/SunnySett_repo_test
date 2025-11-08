@@ -4,20 +4,22 @@ import functions_framework
 from google.cloud import storage
 from github import Github
 import requests
+import json
 
 # ====== ENV CONFIG ======
 BUCKET_NAME = os.getenv("BUCKET_NAME", "user_private_models")
 
 # ====== Helper Function: Recursively Fetch All Files ======
 def fetch_files_recursive(repo, path="", files=None):
+    """Recursively collect .py and .ipynb files from GitHub repo."""
     if files is None:
         files = []
     try:
-        contents = repo.get_contents(path)
+        contents = repo.get_contents(path, ref=repo.default_branch)
         for item in contents:
             if item.type == "dir":
                 fetch_files_recursive(repo, item.path, files)
-            elif item.name.endswith(".py") or item.name == "requirements.txt":
+            elif item.name.endswith((".py", ".ipynb")):
                 files.append(item)
     except Exception as e:
         print(f"⚠️ Error while traversing {path}: {e}")
@@ -39,7 +41,7 @@ def raw_extract_user_repo(request):
         if not username or not repo_name:
             return {"error": "Missing username or repo_name"}, 400
 
-        # ✅ normalize repo_name (avoid duplicated username)
+        # ✅ Normalize repo name
         if "/" in repo_name:
             repo_name = repo_name.split("/")[-1]
 
@@ -56,73 +58,63 @@ def raw_extract_user_repo(request):
         repo_fullname = f"{username}/{repo_name}"
         repo = g.get_repo(repo_fullname)
         print(f"✅ Connected to repo: {repo_fullname}")
-        
-        # ====== Try to get README.md at the beginning ======
-        try:
-           readme_content = repo.get_readme().decoded_content.decode("utf-8")
-           blob = bucket.blob(f"{username}/{repo_name}/_meta/README.md")
-           blob.upload_from_string(readme_content, content_type="text/markdown")
-           print("✅ Saved README.md")
-        except Exception as e:
-           print(f"⚠️ No README.md found or failed to fetch: {e}")
-
-        # ====== Fetch Files Recursively ======
-        py_files = fetch_files_recursive(repo)
-        print(f"📦 Found {len(py_files)} eligible files")
 
         # ====== Initialize GCS Client ======
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
 
-        # ====== Upload raw files ======
+        # ====== Step 1: Fetch README ======
+        readme_content = None
+        try:
+            readme_content = repo.get_readme().decoded_content.decode("utf-8", errors="ignore")
+            print("📘 Fetched README via GitHub API")
+        except Exception:
+            print("⚠️ GitHub API README fetch failed, trying raw URL...")
+            raw_url = f"https://raw.githubusercontent.com/{username}/{repo_name}/{repo.default_branch}/README.md"
+            resp = requests.get(raw_url)
+            if resp.status_code == 200:
+                readme_content = resp.text
+                print("📄 Fetched README via raw.githubusercontent.com")
+            else:
+                print("⚠️ No README found for this repo")
+
+        if readme_content:
+            meta_blob = bucket.blob(f"{username}/{repo_name}/_meta/README.md")
+            meta_blob.upload_from_string(readme_content, content_type="text/plain")
+            print("✅ Uploaded README.md to _meta/")
+        else:
+            print("⚠️ README not found or empty")
+
+        # ====== Step 2: Fetch .py and .ipynb files ======
+        target_files = fetch_files_recursive(repo)
+        print(f"📦 Found {len(target_files)} .py / .ipynb files")
+
         uploaded = 0
-        for file in py_files:
+        for file in target_files:
             try:
+                # 尝试多种方式解码
+                try:
+                    content = file.decoded_content.decode("utf-8", errors="ignore")
+                except Exception:
+                    content = base64.b64decode(file.content).decode("utf-8", errors="ignore")
+
                 blob_path = f"{username}/{repo_name}/raw/{file.path}"
                 blob = bucket.blob(blob_path)
                 blob.upload_from_string(
-                    file.decoded_content,
-                    content_type="text/plain"
+                    content,
+                    content_type="application/json" if file.name.endswith(".ipynb") else "text/plain"
                 )
                 uploaded += 1
                 print(f"✅ Uploaded: {blob_path}")
             except Exception as e:
                 print(f"⚠️ Failed to upload {file.path}: {e}")
 
-        # ====== Create _meta folder & fetch README ======
-        try:
-            readme_content = None
-            try:
-                readme_content = repo.get_readme().decoded_content.decode("utf-8")
-                print("📘 Fetched README via GitHub API")
-            except Exception:
-                print("⚠️ GitHub API README fetch failed, trying raw URL...")
-                # fallback for public repo
-                raw_url = f"https://raw.githubusercontent.com/{username}/{repo_name}/main/README.md"
-                resp = requests.get(raw_url)
-                if resp.status_code == 200:
-                    readme_content = resp.text
-                    print("📄 Fetched README via raw.githubusercontent.com")
-                else:
-                    print("⚠️ No README found for this repo")
-
-            if readme_content:
-                meta_blob = bucket.blob(f"{username}/{repo_name}/_meta/README.md")
-                meta_blob.upload_from_string(readme_content, content_type="text/plain")
-                print(f"✅ Uploaded README.md to _meta/")
-            else:
-                print("⚠️ README not found or empty")
-
-        except Exception as e:
-            print(f"⚠️ README extraction failed: {e}")
-
-        # ====== Create repo_structure.json ======
+        # ====== Step 3: Save repo structure metadata ======
         try:
             structure_data = [
-                {"path": f.path, "size": f.size, "type": f.type}
-                for f in py_files
+                {"path": f.path, "size": getattr(f, "size", None), "type": f.type}
+                for f in target_files
             ]
-            import json
             structure_blob = bucket.blob(f"{username}/{repo_name}/_meta/repo_structure.json")
             structure_blob.upload_from_string(
                 json.dumps(structure_data, indent=2),
@@ -132,7 +124,7 @@ def raw_extract_user_repo(request):
         except Exception as e:
             print(f"⚠️ Failed to create repo_structure.json: {e}")
 
-        print(f"🎉 Done. Total uploaded: {uploaded}")
+        print(f"🎉 Done. Total uploaded: {uploaded} files, plus README if available.")
 
         return {
             "status": "ok",
@@ -140,8 +132,10 @@ def raw_extract_user_repo(request):
             "repo": repo_name,
             "bucket": BUCKET_NAME,
             "files_saved": uploaded,
+            "readme_included": bool(readme_content),
         }
 
     except Exception as e:
         print(f"❌ Error: {e}")
         return {"error": str(e)}, 500
+
